@@ -6,8 +6,8 @@ transaction **exactly once** in the background, with a simulated 30‑second ext
 
 | | |
 |---|---|
-| **Live API** | `https://YOUR-APP.vercel.app` (replace after deploying) |
-| **Interactive docs** | `https://YOUR-APP.vercel.app/docs` |
+| **Live API** | https://transaction-webhook-service-beta.vercel.app |
+| **Interactive docs** | https://transaction-webhook-service-beta.vercel.app/docs |
 | **Stack** | Python 3.12 · FastAPI · SQLAlchemy 2 (async) · Supabase Postgres · Vercel |
 
 ## API
@@ -116,13 +116,13 @@ End-to-end against a running instance (real 30 s delay):
 
 ```bash
 ./scripts/smoke_test.sh                               # local
-./scripts/smoke_test.sh https://YOUR-APP.vercel.app   # deployed
+./scripts/smoke_test.sh https://transaction-webhook-service-beta.vercel.app   # deployed
 ```
 
 Or by hand:
 
 ```bash
-BASE=https://YOUR-APP.vercel.app
+BASE=https://transaction-webhook-service-beta.vercel.app
 BODY='{"transaction_id":"txn_demo_1","source_account":"acc_user_789","destination_account":"acc_merchant_456","amount":1500,"currency":"INR"}'
 
 curl -i -X POST $BASE/v1/webhooks/transactions -H 'Content-Type: application/json' -d "$BODY"   # 202
@@ -146,7 +146,7 @@ curl $BASE/v1/transactions/txn_demo_1      # status: PROCESSED, processed_at set
 
    If you deploy to Vercel first and only know the URL afterwards, run the migration with the
    real URL later or update it:
-   `update vault.secrets set secret = 'https://YOUR-APP.vercel.app/v1/internal/process' where name = 'processor_url';`
+   `update vault.secrets set secret = 'https://transaction-webhook-service-beta.vercel.app/v1/internal/process' where name = 'processor_url';`
 
 ### 2. Vercel
 
@@ -166,7 +166,7 @@ curl $BASE/v1/transactions/txn_demo_1      # status: PROCESSED, processed_at set
    | `AUTO_CREATE_TABLES` | `false` |
    | `PROCESSING_DELAY_SECONDS` | `30` (optional, default) |
 
-3. Deploy, then run `./scripts/smoke_test.sh https://YOUR-APP.vercel.app`.
+3. Deploy, then run `./scripts/smoke_test.sh https://transaction-webhook-service-beta.vercel.app`.
 
 Debugging the pipeline from the Supabase SQL editor:
 
