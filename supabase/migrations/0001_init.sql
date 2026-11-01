@@ -31,6 +31,7 @@ create table if not exists public.transactions (
                         check (status in ('PROCESSING', 'PROCESSED')),
     created_at          timestamptz not null default now(),
     processed_at        timestamptz,
+    processing_started_at timestamptz,            -- lease: set when a worker claims the row
     processing_attempts integer not null default 0,
     last_error          text,
     constraint transactions_transaction_id_key unique (transaction_id)   -- idempotency
@@ -111,6 +112,7 @@ begin
         from public.transactions
         where status = 'PROCESSING'
           and created_at < now() - interval '2 minutes'
+          and (processing_started_at is null or processing_started_at < now() - interval '2 minutes')
           and processing_attempts < 20
         order by created_at
         limit 100

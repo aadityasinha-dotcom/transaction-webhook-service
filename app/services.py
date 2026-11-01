@@ -2,9 +2,9 @@
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -62,6 +62,9 @@ async def record_webhook(session: AsyncSession, payload: TransactionWebhook) -> 
     return existing, False
 
 
+PROCESSING_LEASE_SECONDS = 90  # a claim older than this is considered dead and may be retried
+
+
 async def process_transaction(
     session_factory: async_sessionmaker[AsyncSession],
     transaction_id: str,
@@ -69,10 +72,19 @@ async def process_transaction(
 ) -> str:
     """Simulate the slow external call, then mark the transaction PROCESSED.
 
-    Returns "processed" or "already_processed". Raises TransactionNotFound for unknown ids.
-    The DB connection is *not* held during the delay so a burst of transactions cannot
-    exhaust the connection pool.
+    Returns "processed", "in_progress" (another invocation holds the lease) or
+    "already_processed". Raises TransactionNotFound for unknown ids.
+
+    Exactly-once is enforced in two places:
+      1. A *claim* before the slow work: one atomic UPDATE sets processing_started_at only if the
+         row is still PROCESSING and not already claimed (or the claim is older than the lease).
+         Duplicate deliveries therefore return immediately instead of sleeping 30 s.
+      2. A conditional UPDATE after the work: only a PROCESSING row can become PROCESSED.
+    The DB connection is *not* held during the delay so a burst of transactions cannot exhaust
+    the connection pool. If the process dies mid-sleep, the lease expires and the retry job
+    re-triggers processing.
     """
+    now = datetime.now(UTC)
     async with session_factory() as session:
         transaction = await get_transaction(session, transaction_id)
         if transaction is None:
@@ -81,6 +93,22 @@ async def process_transaction(
             return "already_processed"
         row_id = transaction.id
 
+        lease_cutoff = now - timedelta(seconds=PROCESSING_LEASE_SECONDS)
+        claim = await session.execute(
+            update(Transaction)
+            .where(
+                Transaction.id == row_id,
+                Transaction.status == TransactionStatus.PROCESSING.value,
+                or_(Transaction.processing_started_at.is_(None), Transaction.processing_started_at < lease_cutoff),
+            )
+            .values(processing_started_at=now, processing_attempts=Transaction.processing_attempts + 1)
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+    if claim.rowcount == 0:
+        logger.info("Transaction %s is already being processed; ignoring duplicate trigger", transaction_id)
+        return "in_progress"
+
     try:
         await asyncio.sleep(delay_seconds)  # stand-in for external API calls
     except Exception as exc:  # pragma: no cover - defensive; recorded so the retry job can see it
@@ -88,21 +116,14 @@ async def process_transaction(
         raise
 
     async with session_factory() as session:
-        # Conditional update: only one caller can flip PROCESSING -> PROCESSED, so even if the
-        # trigger and the retry job both fire, the transaction is processed exactly once.
         result = await session.execute(
             update(Transaction)
             .where(Transaction.id == row_id, Transaction.status == TransactionStatus.PROCESSING.value)
-            .values(
-                status=TransactionStatus.PROCESSED.value,
-                processed_at=datetime.now(UTC),
-                processing_attempts=Transaction.processing_attempts + 1,
-                last_error=None,
-            )
+            .values(status=TransactionStatus.PROCESSED.value, processed_at=datetime.now(UTC), last_error=None)
         )
         await session.commit()
 
-    if result.rowcount == 0:
+    if result.rowcount == 0:  # pragma: no cover - only if someone processed it despite our lease
         return "already_processed"
     logger.info("Processed transaction %s", transaction_id)
     return "processed"
@@ -113,6 +134,6 @@ async def _record_failure(session_factory: async_sessionmaker[AsyncSession], row
         await session.execute(
             update(Transaction)
             .where(Transaction.id == row_id)
-            .values(processing_attempts=Transaction.processing_attempts + 1, last_error=str(exc)[:2000])
+            .values(processing_started_at=None, last_error=str(exc)[:2000])
         )
         await session.commit()

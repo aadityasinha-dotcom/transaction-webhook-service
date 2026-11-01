@@ -68,4 +68,4 @@ class ProcessRequest(BaseModel):
 
 class ProcessResult(BaseModel):
     transaction_id: str
-    outcome: Literal["processed", "already_processed"]
+    outcome: Literal["processed", "in_progress", "already_processed"]

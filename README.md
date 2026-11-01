@@ -71,13 +71,15 @@ Malformed payloads get `422`. Duplicate `transaction_id`s still get `202` but ar
 2. **Trigger** – Vercel functions are serverless, so nothing can keep running after the
    response. Instead, a Postgres `AFTER INSERT` trigger uses `pg_net` to make an
    *asynchronous* HTTP call to `/v1/internal/process`. The insert is never slowed down.
-3. **Processing** – the internal endpoint sleeps 30 s (the DB connection is released during
-   the sleep) and then runs a *conditional* update (`WHERE status = 'PROCESSING'`). Only one
-   caller can win that update, so re-deliveries from the trigger or the retry job can never
-   process a transaction twice.
-4. **Reliability** – a `pg_cron` job re-triggers any transaction still `PROCESSING` after two
-   minutes (lost request, function crash, deploy mid-processing). Failures are recorded in
-   `last_error` / `processing_attempts` for inspection.
+3. **Processing** – the internal endpoint first *claims* the row with one atomic update
+   (`processing_started_at = now() WHERE status = 'PROCESSING' AND lease not held`). A
+   duplicate delivery, which does happen in practice with `pg_net`, therefore returns
+   `in_progress` immediately instead of sleeping. The winner sleeps 30 s (the DB connection
+   is released during the sleep) and then runs a second conditional update
+   (`WHERE status = 'PROCESSING'`), so a transaction can never be processed twice.
+4. **Reliability** – a `pg_cron` job re-triggers any transaction still `PROCESSING` whose
+   claim is older than two minutes (lost request, function crash, deploy mid-processing).
+   Failures are recorded in `last_error` / `processing_attempts` for inspection.
 
 Locally (or on any long-lived server) set `PROCESSING_TRIGGER=inline` and the same processing
 function runs as a FastAPI background task right after the `202`, with no Supabase trigger needed.
@@ -143,6 +145,7 @@ curl $BASE/v1/transactions/txn_demo_1      # status: PROCESSED, processed_at set
 4. Open `supabase/migrations/0001_init.sql`, set the two `vault.create_secret(...)` values
    (your Vercel URL + `/v1/internal/process`, and the secret), then run the whole file in
    **SQL Editor**. It creates the table, the trigger, the retry cron job and enables `pg_net`/`pg_cron`.
+   Apply any later files in `supabase/migrations/` in order the same way.
 
    If you deploy to Vercel first and only know the URL afterwards, run the migration with the
    real URL later or update it:
@@ -187,8 +190,8 @@ select transaction_id, status, processing_attempts, last_error from public.trans
   single 30 s step. Postgres already offers a durable queue (the table), an async HTTP
   client (`pg_net`) and a scheduler (`pg_cron`), so the whole pipeline lives in the database
   and nothing is lost if a function dies.
-- **Conditional `UPDATE ... WHERE status='PROCESSING'`** – exactly-once processing without
-  locks, even with overlapping deliveries.
+- **Lease + conditional `UPDATE ... WHERE status='PROCESSING'`** – exactly-once processing
+  without locks, and duplicate deliveries cost milliseconds rather than a 30 s invocation.
 - **Connection released during the 30 s sleep** – a burst of webhooks cannot exhaust the pool.
 - **Timestamps in UTC, amounts as `Numeric(18,2)`** – no float money, no timezone ambiguity.
 - **Same code path for local and cloud** – `PROCESSING_TRIGGER=inline` runs processing as a
@@ -205,7 +208,7 @@ app/
   schemas.py       request/response models
   services.py      record_webhook (idempotent insert) + process_transaction
   routers/         health, webhooks, transactions, internal
-supabase/migrations/0001_init.sql   schema, trigger, retry cron
+supabase/migrations/               schema, trigger, retry cron (apply in order)
 scripts/smoke_test.sh               end-to-end check
 tests/                              pytest suite
 vercel.json                         function maxDuration

@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -8,7 +9,7 @@ from sqlalchemy import func, select
 from app.db import get_session_factory
 from app.models import Transaction
 from app.schemas import TransactionWebhook
-from app.services import process_transaction, record_webhook
+from app.services import PROCESSING_LEASE_SECONDS, process_transaction, record_webhook
 
 ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -84,11 +85,39 @@ async def test_processing_is_idempotent_even_if_triggered_twice(webhook_payload)
         process_transaction(factory, "txn_abc123def456", 0),
         process_transaction(factory, "txn_abc123def456", 0),
     )
-    assert sorted([first, second]) == ["already_processed", "processed"]
+    assert sorted([first, second]) == ["in_progress", "processed"]
     async with factory() as session:
         txn = await session.scalar(select(Transaction))
         assert txn.status == "PROCESSED"
         assert txn.processing_attempts == 1
+
+
+async def test_stale_lease_is_retried(webhook_payload):
+    """If a worker died mid-processing, the retry job must be able to claim the row again."""
+    factory = get_session_factory()
+    async with factory() as session:
+        await record_webhook(session, TransactionWebhook(**webhook_payload))
+        txn = await session.scalar(select(Transaction))
+        txn.processing_started_at = datetime.now(UTC) - timedelta(seconds=PROCESSING_LEASE_SECONDS + 1)
+        txn.processing_attempts = 1
+        await session.commit()
+
+    assert await process_transaction(factory, "txn_abc123def456", 0) == "processed"
+    async with factory() as session:
+        txn = await session.scalar(select(Transaction))
+        assert txn.status == "PROCESSED"
+        assert txn.processing_attempts == 2
+
+
+async def test_fresh_lease_is_not_retried(webhook_payload):
+    factory = get_session_factory()
+    async with factory() as session:
+        await record_webhook(session, TransactionWebhook(**webhook_payload))
+        txn = await session.scalar(select(Transaction))
+        txn.processing_started_at = datetime.now(UTC)
+        await session.commit()
+
+    assert await process_transaction(factory, "txn_abc123def456", 0) == "in_progress"
 
 
 async def test_processing_waits_for_the_configured_delay(webhook_payload):
